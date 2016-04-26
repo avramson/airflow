@@ -39,6 +39,7 @@ import signal
 import socket
 import sys
 import traceback
+import time
 import warnings
 from urllib.parse import urlparse
 
@@ -57,6 +58,7 @@ from airflow import settings, utils
 from airflow.executors import DEFAULT_EXECUTOR, LocalExecutor
 from airflow import configuration
 from airflow.exceptions import AirflowException, AirflowSkipException
+from airflow.dag_loader import DagParser, ParallelDagParser
 from airflow.utils.dates import cron_presets, date_range as utils_date_range
 from airflow.utils.db import provide_session
 from airflow.utils.decorators import apply_defaults
@@ -148,7 +150,8 @@ class DagBag(LoggingMixin):
             dag_folder=None,
             executor=DEFAULT_EXECUTOR,
             include_examples=configuration.getboolean('core', 'LOAD_EXAMPLES'),
-            sync_to_db=False):
+            sync_to_db=False,
+            load_dags=True):
 
         dag_folder = dag_folder or DAGS_FOLDER
         self.logger.info("Filling up the DagBag from {}".format(dag_folder))
@@ -244,6 +247,7 @@ class DagBag(LoggingMixin):
 
             with timeout(configuration.getint('core', "DAGBAG_IMPORT_TIMEOUT")):
                 try:
+                    logging.info("Importing {} {}".format(mod_name, filepath))
                     m = imp.load_source(mod_name, filepath)
                     mods.append(m)
                 except Exception as e:
@@ -289,8 +293,13 @@ class DagBag(LoggingMixin):
                         dag.full_filepath = filepath
                     dag.is_subdag = False
                     dag.module_name = m.__name__
-                    self.bag_dag(dag, parent_dag=dag, root_dag=dag)
+                    # self.bag_dag(dag, parent_dag=dag, root_dag=dag)
+                    self._add_dags([dag])
+                    subdags = self._get_all_subdags(dag)
+                    self._add_dags(subdags)
                     found_dags.append(dag)
+                    # TODO: Why does found dags only include the immediate
+                    # subdags, but not the subdags of the subdags?
                     found_dags += dag.subdags
 
         self.file_last_changed[filepath] = dttm
@@ -366,7 +375,54 @@ class DagBag(LoggingMixin):
             self.bag_dag(subdag, parent_dag=dag, root_dag=root_dag)
         self.logger.debug('Loaded DAG {dag}'.format(**locals()))
 
-    def collect_dags(
+    def _add_dags(self, dags):
+        for dag in dags:
+            self.dags[dag.dag_id] = dag
+
+    def _get_all_subdags(self, dag):
+        return self._get_all_subdags_helper(dag, parent_dag=dag, root_dag=dag)
+
+    def _get_all_subdags_helper(self, dag, parent_dag, root_dag):
+        """
+        Traverses the DAG and returns a list of all subdags found in the DAG, including this.
+        :param dag: the DAG to traverse
+        :return: a list of DAG's that are sub-dags of dag
+        """
+
+        subdags = []
+        dag.resolve_template_files()
+        dag.last_loaded = datetime.now()
+
+        for task in dag.tasks:
+            settings.policy(task)
+
+        if self.sync_to_db:
+            session = settings.Session()
+            orm_dag = session.query(
+                DagModel).filter(DagModel.dag_id == dag.dag_id).first()
+            if not orm_dag:
+                orm_dag = DagModel(dag_id=dag.dag_id)
+            orm_dag.fileloc = root_dag.full_filepath
+            orm_dag.is_subdag = dag.is_subdag
+            orm_dag.owners = root_dag.owner
+            orm_dag.is_active = True
+            session.merge(orm_dag)
+            session.commit()
+            session.close()
+
+        for subdag in dag.subdags:
+            subdags.append(subdag)
+            subdag.full_filepath = dag.full_filepath
+            subdag.parent_dag = dag
+            subdag.fileloc = root_dag.full_filepath
+            subdag.is_subdag = True
+            subdags += self._get_all_subdags_helper(subdag, parent_dag=dag, root_dag=root_dag)
+        return subdags
+
+    def list_files(self, directory):
+
+
+    def original_collect_dags(
             self,
             dag_folder=None,
             only_if_updated=True):
@@ -379,6 +435,7 @@ class DagBag(LoggingMixin):
         ignoring files that match any of the regex patterns specified
         in the file.
         """
+
         start_dttm = datetime.now()
         dag_folder = dag_folder or self.dag_folder
         if os.path.isfile(dag_folder):
@@ -411,6 +468,131 @@ class DagBag(LoggingMixin):
         Stats.gauge(
             'dagbag_size', len(self.dags), 1)
 
+
+    def collect_dags(
+            self,
+            dag_folder=None,
+            only_if_updated=True):
+        """
+        Given a file path or a folder, this method looks for python modules,
+        imports them and adds them to the dagbag collection.
+
+        Note that if a .airflowignore file is found while processing,
+        the directory, it will behaves much like a .gitignore does,
+        ignoring files that match any of the regex patterns specified
+        in the file.
+        """
+        start_dttm = datetime.now()
+        logging.info("Using modified scheduler")
+        dag_folder = dag_folder or self.dag_folder
+        logging.info("DAG folder is {}".format(dag_folder))
+        file_paths_to_process = []
+        if os.path.isfile(dag_folder):
+            file_paths_to_process.append(dag_folder)
+            #self.process_file(dag_folder, only_if_updated=only_if_updated)
+        elif os.path.isdir(dag_folder):
+            patterns = []
+            for root, dirs, files in os.walk(dag_folder, followlinks=True):
+                ignore_file = [f for f in files if f == '.airflowignore']
+                if ignore_file:
+                    f = open(os.path.join(root, ignore_file[0]), 'r')
+                    patterns += [p for p in f.read().split('\n') if p]
+                    f.close()
+                for f in files:
+                    filepath = os.path.join(root, f)
+                    if not os.path.isfile(filepath):
+                        continue
+                    mod_name, file_ext = os.path.splitext(
+                        os.path.split(filepath)[-1])
+                    if file_ext != '.py':
+                        continue
+                    if not any(
+                            [re.findall(p, filepath) for p in patterns]):
+                        file_paths_to_process.append(filepath)
+                        # Remove me
+                        #self.process_file(
+                        #     filepath, only_if_updated=only_if_updated)
+        logging.info("Need to process {} files in the DAG folder".format(len(file_paths_to_process)))
+
+
+        file_load_timeout = configuration.getint('core', "DAGBAG_IMPORT_TIMEOUT")
+        dag_file_loader = DagParser(file_load_timeout)
+
+        # num_dag_ids_found = 0
+        # dag_file_load_results = []
+        # for file_path in file_paths_to_process:
+        #     # Prior to subprocess change
+        #     # self.process_file(filepath, only_if_updated=only_if_updated)
+        #     dag_ids_in_file = dag_file_loader.get_dags_ids_in_file(
+        #         file_path,
+        #         only_if_updated=only_if_updated,
+        #         safe_mode=True)
+        #     self.logger.info("Found DAG IDs {} in {}".format(dag_ids_in_file, file_path))
+        #     dag_file_load_results.append(DagFileResult(file_path, dag_ids_in_file))
+        #     num_dag_ids_found += len(dag_ids_in_file)
+
+        # TODO: Make configurable
+        parallelism = 1
+        dag_parser = ParallelDagParser(file_load_timeout, parallelism)
+        self.logger.info("Using parallelism of {} to process {} files"
+                         .format(parallelism, len(file_paths_to_process)))
+
+        start_time = time.time()
+        all_parse_results = dag_parser.parse_files_for_dag_ids(file_paths_to_process)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        time_per_file = elapsed_time / len(file_paths_to_process)
+        self.logger.info("Parsed {} files in {:.2f} seconds. Rate is {:.2f}ms per file".format(
+            len(file_paths_to_process),
+            elapsed_time,
+            time_per_file * 1000))
+
+        good_parse_results = []
+        num_dag_ids = 0
+        for parse_result in all_parse_results:
+            if not parse_result.exception_trace:
+                good_parse_results.append(parse_result)
+                num_dag_ids += len(parse_result.dag_ids)
+            else:
+                self.logger.error("Error parsing {} - Got exception:\n{}".format(
+                    filepath,
+                    parse_result.exception_trace))
+
+        self.logger.info("Found {} DAG IDs - now loading them into this process"
+                         .format(num_dag_ids))
+
+        # Now that the DAGs IDs have been found, parse the files to load them in memory
+        dags = []
+        load_dags_start_time = time.time()
+        for dag_file_load_result in good_parse_results:
+            if len(dag_file_load_result.dag_ids) > 0:
+                start_time = time.time()
+                dags += dag_file_loader.get_dags_in_file(
+                    dag_file_load_result.dag_ids,
+                    dag_file_load_result.file_path)
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                self.logger.info("Loading DAG IDs {} from {} took {:.2f}ms".format(
+                    dag_file_load_result.dag_ids,
+                    dag_file_load_result.file_path,
+                    elapsed_time * 1000))
+        load_dags_end_time = time.time()
+        self.logger.info("Loading {} files took {:.2f}ms".format(
+            len(good_parse_results),
+            (load_dags_end_time - load_dags_start_time) * 1000))
+
+
+        self._add_dags(dags)
+        for dag in dags:
+            subdags = self._get_all_subdags(dag)
+            self._add_dags(subdags)
+
+        Stats.gauge(
+            'collect_dags', (datetime.now() - start_dttm).total_seconds(), 1)
+        Stats.gauge(
+            'dagbag_size', len(self.dags), 1)
+
+
     def deactivate_inactive_dags(self):
         active_dag_ids = [dag.dag_id for dag in list(self.dags.values())]
         session = settings.Session()
@@ -429,6 +611,17 @@ class DagBag(LoggingMixin):
         session.close()
         return dag_ids
 
+
+class DagFileResult():
+    def __init__(self, file_path, dag_ids):
+        self.file_path = file_path
+        self.dag_ids = dag_ids
+
+    def get_file_path(self):
+        return self.file_path
+
+    def get_dag_ids(self):
+        return self.dag_ids
 
 class User(Base):
     __tablename__ = "users"
