@@ -151,25 +151,29 @@ class DagBag(LoggingMixin):
             dag_folder=None,
             executor=DEFAULT_EXECUTOR,
             include_examples=configuration.getboolean('core', 'LOAD_EXAMPLES'),
-            sync_to_db=False):
+            sync_to_db=None,
+            load_dags=True):
 
         dag_folder = dag_folder or DAGS_FOLDER
         self.logger.info("Filling up the DagBag from {}".format(dag_folder))
         self.dag_folder = dag_folder
         self.dags = {}
-        self.sync_to_db = sync_to_db
+        #self.sync_to_db = sync_to_db
         self.file_last_changed = {}
         self.executor = executor
         self.import_errors = {}
-        if include_examples:
-            example_dag_folder = os.path.join(
-                os.path.dirname(__file__),
-                'example_dags')
-            self.collect_dags(example_dag_folder)
-        self.collect_dags(dag_folder)
-        if sync_to_db:
-            self.deactivate_inactive_dags()
 
+        if load_dags:
+            if include_examples:
+                example_dag_folder = os.path.join(
+                    os.path.dirname(__file__),
+                    'example_dags')
+                self.collect_dags(example_dag_folder)
+            self.collect_dags(dag_folder)
+        #if sync_to_db:
+        #    self.deactivate_inactive_dags()
+        if sync_to_db is not None:
+            raise Exception("sync_to_db should be None!")
     def size(self):
         """
         :return: the amount of dags contained in this dagbag
@@ -347,27 +351,96 @@ class DagBag(LoggingMixin):
         for task in dag.tasks:
             settings.policy(task)
 
-        if self.sync_to_db:
-            session = settings.Session()
-            orm_dag = session.query(
-                DagModel).filter(DagModel.dag_id == dag.dag_id).first()
-            if not orm_dag:
-                orm_dag = DagModel(dag_id=dag.dag_id)
-            orm_dag.fileloc = root_dag.full_filepath
-            orm_dag.is_subdag = dag.is_subdag
-            orm_dag.owners = root_dag.owner
-            orm_dag.is_active = True
-            session.merge(orm_dag)
-            session.commit()
-            session.close()
+        # if self.sync_to_db:
+        #     session = settings.Session()
+        #     orm_dag = session.query(
+        #         DagModel).filter(DagModel.dag_id == dag.dag_id).first()
+        #     if not orm_dag:
+        #         orm_dag = DagModel(dag_id=dag.dag_id)
+        #     orm_dag.fileloc = root_dag.full_filepath
+        #     orm_dag.is_subdag = dag.is_subdag
+        #     orm_dag.owners = root_dag.owner
+        #     orm_dag.is_active = True
+        #     session.merge(orm_dag)
+        #     session.commit()
+        #     session.close()
 
         for subdag in dag.subdags:
             subdag.full_filepath = dag.full_filepath
             subdag.parent_dag = dag
             subdag.fileloc = root_dag.full_filepath
             subdag.is_subdag = True
+            subdag.owner = dag.owner
             self.bag_dag(subdag, parent_dag=dag, root_dag=root_dag)
         self.logger.debug('Loaded DAG {dag}'.format(**locals()))
+
+    def list_py_file_paths(self, directory):
+        file_paths = []
+        if os.path.isfile(directory):
+            return [directory]
+        elif os.path.isdir(directory):
+            patterns = []
+            for root, dirs, files in os.walk(directory, followlinks=True):
+                ignore_file = [f for f in files if f == '.airflowignore']
+                if ignore_file:
+                    f = open(os.path.join(root, ignore_file[0]), 'r')
+                    patterns += [p for p in f.read().split('\n') if p]
+                    f.close()
+                for f in files:
+                    try:
+                        file_path = os.path.join(root, f)
+                        if not os.path.isfile(file_path):
+                            continue
+                        mod_name, file_ext = os.path.splitext(
+                            os.path.split(file_path)[-1])
+                        if file_ext != '.py':
+                            continue
+                        if not any(
+                                [re.findall(p, file_path) for p in patterns]):
+                            file_paths.append(file_path)
+                    except Exception as e:
+                        logging.exception("Error while examining {}".format(f))
+
+    def modified_collect_dags(
+            self,
+            dag_folder=None,
+            only_if_updated=True):
+        """
+        Given a file path or a folder, this method looks for python modules,
+        imports them and adds them to the dagbag collection.
+
+        Note that if a .airflowignore file is found while processing,
+        the directory, it will behaves much like a .gitignore does,
+        ignoring files that match any of the regex patterns specified
+        in the file.
+        """
+
+        start_dttm = datetime.now()
+        dag_folder = dag_folder or self.dag_folder
+        if os.path.isfile(dag_folder):
+            self.process_file(dag_folder, only_if_updated=only_if_updated)
+        elif os.path.isdir(dag_folder):
+            patterns = []
+            for root, dirs, files in os.walk(directory, followlinks=True):
+                ignore_file = [f for f in files if f == '.airflowignore']
+                if ignore_file:
+                    f = open(os.path.join(root, ignore_file[0]), 'r')
+                    patterns += [p for p in f.read().split('\n') if p]
+                    f.close()
+                for f in files:
+                    try:
+                        file_path = os.path.join(root, f)
+                        if not os.path.isfile(file_path):
+                            continue
+                        mod_name, file_ext = os.path.splitext(
+                            os.path.split(file_path)[-1])
+                        if file_ext != '.py':
+                            continue
+                        if not any(
+                                [re.findall(p, file_path) for p in patterns]):
+                            file_paths.append(file_path)
+                    except Exception as e:
+                        logging.exception("Error while examining {}".format(f))
 
     def collect_dags(
             self,
@@ -755,6 +828,35 @@ class TaskInstance(Base):
                 cmd += "-sd {dag.full_filepath}"
         return cmd.format(**locals())
 
+    @staticmethod
+    def generate_command(dag_id,
+                         task_id,
+                         execution_date,
+                         mark_success=False,
+                         ignore_dependencies=False,
+                         ignore_depends_on_past=False,
+                         force=False,
+                         local=False,
+                         pickle_id=None,
+                         full_file_path=None,
+                         raw=False,
+                         job_id=None,
+                         pool=None
+                         ):
+        iso = execution_date.isoformat()
+        cmd = "airflow run {dag_id} {task_id} {iso} "
+        cmd += "--mark_success " if mark_success else ""
+        cmd += "--pickle {pickle_id} " if pickle_id else ""
+        cmd += "--job_id {job_id} " if job_id else ""
+        cmd += "-i " if ignore_dependencies else ""
+        cmd += "-I " if ignore_depends_on_past else ""
+        cmd += "--force " if force else ""
+        cmd += "--local " if local else ""
+        cmd += "--pool {pool} " if pool else ""
+        cmd += "--raw " if raw else ""
+        cmd += "-sd {full_file_path}"
+        return cmd.format(**locals())
+
     @property
     def log_filepath(self):
         iso = self.execution_date.isoformat()
@@ -895,18 +997,28 @@ class TaskInstance(Base):
         """
         # is the execution date in the future?
         if self.execution_date > datetime.now():
+            # Remove me:
+            #logging.info("1 Returning false for {} {}".format(self.task_id, self.execution_date))
             return False
         # is the task still in the retry waiting period?
         elif self.state == State.UP_FOR_RETRY and not self.ready_for_retry():
+            # Remove me:
+            #logging.info("2 Returning false for {} {}".format(self.task_id, self.execution_date))
             return False
         # does the task have an end_date prior to the execution date?
         elif self.task.end_date and self.execution_date > self.task.end_date:
+            # Remove me:
+            #logging.info("3 Returning false for {} {}".format(self.task_id, self.execution_date))
             return False
         # has the task been skipped?
         elif self.state == State.SKIPPED:
+            # Remove me:
+            #logging.info("4 Returning false for {} {}".format(self.task_id, self.execution_date))
             return False
         # has the task already been queued (and are we excluding queued tasks)?
         elif self.state == State.QUEUED and not include_queued:
+            # Remove me:
+            #.info("5 Returning false for {} {}".format(self.task_id, self.execution_date))
             return False
         # is the task runnable and have its dependencies been met?
         elif (
@@ -914,9 +1026,13 @@ class TaskInstance(Base):
                 self.are_dependencies_met(
                     ignore_depends_on_past=ignore_depends_on_past,
                     flag_upstream_failed=flag_upstream_failed)):
+            # Remove me:
+            #logging.info("7 Returning true for {} {} {}".format(self.task_id, self.execution_date, self.state))
             return True
         # anything else
         else:
+            # Remove me:
+            #logging.info("6 Returning false for {} {} {}".format(self.task_id, self.execution_date, self.state))
             return False
 
     def is_runnable(
@@ -3063,6 +3179,38 @@ class DAG(LoggingMixin):
         parser = cli.CLIFactory.get_parser(dag_parser=True)
         args = parser.parse_args()
         args.func(args, self)
+
+    @staticmethod
+    @provide_session
+    def sync_to_db(dag, session=None):
+        """Save attributes about this DAG to the DB. Note that this method
+        can be called for both DAGs and SubDAGs, which is actually a
+        SubDagOperator"""
+        orm_dag = session.query(
+            DagModel).filter(DagModel.dag_id == dag.dag_id).first()
+        if not orm_dag:
+            orm_dag = DagModel(dag_id=dag.dag_id)
+            logging.info("Creating ORM DAG for {}".format(dag.dag_id))
+        orm_dag.fileloc = dag.full_filepath
+        orm_dag.is_subdag = dag.is_subdag
+        orm_dag.owners = dag.owner
+        orm_dag.is_active = True
+        session.merge(orm_dag)
+        session.commit()
+
+    @staticmethod
+    @provide_session
+    def deactivate_unknown_dags(active_dag_ids, session=None):
+        """Given a list of known DAGs, deactivate any other DAGs that are
+        marked as active in the ORM"""
+        if len(active_dag_ids) == 0:
+            return
+
+        for dag in session.query(
+                DagModel).filter(~DagModel.dag_id.in_(active_dag_ids)).all():
+            dag.is_active = False
+            session.merge(dag)
+
 
 
 class Chart(Base):
