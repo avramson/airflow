@@ -35,11 +35,13 @@ from sqlalchemy.orm.session import make_transient
 from airflow import executors, models, settings
 from airflow import configuration as conf
 from airflow.exceptions import AirflowException
+from airflow.executors import DEFAULT_EXECUTOR
 from airflow.utils.state import State
 from airflow.utils.db import provide_session, pessimistic_connection_handling
 from airflow.utils.email import send_email
 from airflow.utils.logging import LoggingMixin
 from airflow.utils import asciiart
+from airflow.utils import dag_utils
 
 Base = models.Base
 ID_LEN = models.ID_LEN
@@ -696,16 +698,34 @@ class SchedulerJob(BaseJob):
                 self.logger.exception(e)
 
     def _execute(self):
-        TI = models.TaskInstance
-
         pessimistic_connection_handling()
 
         logging.basicConfig(level=logging.DEBUG)
         self.logger.info("Starting the scheduler")
 
-        dagbag = models.DagBag(self.subdir, sync_to_db=True)
-        executor = self.executor = dagbag.executor
+        # Build up a list of Python files that could contain DAGs
+        file_paths = dag_utils.list_py_file_paths(self.subdir)
+        executor = DEFAULT_EXECUTOR
         executor.start()
+
+        self.runs = 0
+        while not self.num_runs or self.num_runs > self.runs:
+            self.runs += 1
+            loop_start_dttm = datetime.now()
+            try:
+                for file_path in file_paths:
+                    self.logger.info("Scheduling DAGs in file {}".format(file_path))
+                    self._schedule_one_file(file_path, executor)
+            except Exception as deep_e:
+                self.logger.exception(deep_e)
+                raise
+            finally:
+                settings.Session.remove()
+        executor.end()
+
+    def _schedule_one_file(self, file_path, executor):
+        dagbag = models.DagBag(file_path, sync_to_db=True)
+        TI = models.TaskInstance
         self.runs = 0
         while not self.num_runs or self.num_runs > self.runs:
             try:
@@ -753,6 +773,10 @@ class SchedulerJob(BaseJob):
                     j.start()
                 for j in jobs:
                     j.join()
+
+                for dag in dags:
+                    logging.info("Scheduling DAG ID {}".format(dag))
+                    self._do_dags(dagbag, dags, tis_q)
 
                 while not tis_q.empty():
                     ti_key, pickle_id = tis_q.get()

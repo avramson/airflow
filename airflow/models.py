@@ -148,7 +148,8 @@ class DagBag(LoggingMixin):
             dag_folder=None,
             executor=DEFAULT_EXECUTOR,
             include_examples=configuration.getboolean('core', 'LOAD_EXAMPLES'),
-            sync_to_db=False):
+            sync_to_db=False,
+            load_dags=True):
 
         dag_folder = dag_folder or DAGS_FOLDER
         self.logger.info("Filling up the DagBag from {}".format(dag_folder))
@@ -158,12 +159,14 @@ class DagBag(LoggingMixin):
         self.file_last_changed = {}
         self.executor = executor
         self.import_errors = {}
-        if include_examples:
-            example_dag_folder = os.path.join(
-                os.path.dirname(__file__),
-                'example_dags')
-            self.collect_dags(example_dag_folder)
-        self.collect_dags(dag_folder)
+
+        if load_dags:
+            if include_examples:
+                example_dag_folder = os.path.join(
+                    os.path.dirname(__file__),
+                    'example_dags')
+                self.collect_dags(example_dag_folder)
+            self.collect_dags(dag_folder)
         if sync_to_db:
             self.deactivate_inactive_dags()
 
@@ -365,6 +368,33 @@ class DagBag(LoggingMixin):
             subdag.is_subdag = True
             self.bag_dag(subdag, parent_dag=dag, root_dag=root_dag)
         self.logger.debug('Loaded DAG {dag}'.format(**locals()))
+
+    def list_py_file_paths(self, directory):
+        file_paths = []
+        if os.path.isfile(directory):
+            return [directory]
+        elif os.path.isdir(directory):
+            patterns = []
+            for root, dirs, files in os.walk(directory, followlinks=True):
+                ignore_file = [f for f in files if f == '.airflowignore']
+                if ignore_file:
+                    f = open(os.path.join(root, ignore_file[0]), 'r')
+                    patterns += [p for p in f.read().split('\n') if p]
+                    f.close()
+                for f in files:
+                    try:
+                        file_path = os.path.join(root, f)
+                        if not os.path.isfile(file_path):
+                            continue
+                        mod_name, file_ext = os.path.splitext(
+                            os.path.split(file_path)[-1])
+                        if file_ext != '.py':
+                            continue
+                        if not any(
+                                [re.findall(p, file_path) for p in patterns]):
+                            file_paths.append(file_path)
+                    except Exception as e:
+                        logging.exception("Error while examining {}".format(f))
 
     def collect_dags(
             self,
