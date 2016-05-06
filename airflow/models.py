@@ -396,6 +396,47 @@ class DagBag(LoggingMixin):
                     except Exception as e:
                         logging.exception("Error while examining {}".format(f))
 
+    def modified_collect_dags(
+            self,
+            dag_folder=None,
+            only_if_updated=True):
+        """
+        Given a file path or a folder, this method looks for python modules,
+        imports them and adds them to the dagbag collection.
+
+        Note that if a .airflowignore file is found while processing,
+        the directory, it will behaves much like a .gitignore does,
+        ignoring files that match any of the regex patterns specified
+        in the file.
+        """
+
+        start_dttm = datetime.now()
+        dag_folder = dag_folder or self.dag_folder
+        if os.path.isfile(dag_folder):
+            self.process_file(dag_folder, only_if_updated=only_if_updated)
+        elif os.path.isdir(dag_folder):
+            patterns = []
+            for root, dirs, files in os.walk(directory, followlinks=True):
+                ignore_file = [f for f in files if f == '.airflowignore']
+                if ignore_file:
+                    f = open(os.path.join(root, ignore_file[0]), 'r')
+                    patterns += [p for p in f.read().split('\n') if p]
+                    f.close()
+                for f in files:
+                    try:
+                        file_path = os.path.join(root, f)
+                        if not os.path.isfile(file_path):
+                            continue
+                        mod_name, file_ext = os.path.splitext(
+                            os.path.split(file_path)[-1])
+                        if file_ext != '.py':
+                            continue
+                        if not any(
+                                [re.findall(p, file_path) for p in patterns]):
+                            file_paths.append(file_path)
+                    except Exception as e:
+                        logging.exception("Error while examining {}".format(f))
+
     def collect_dags(
             self,
             dag_folder=None,
@@ -739,6 +780,35 @@ class TaskInstance(Base):
                 cmd += "-sd DAGS_FOLDER/{dag.filepath} "
             elif dag.full_filepath:
                 cmd += "-sd {dag.full_filepath}"
+        return cmd.format(**locals())
+
+    @staticmethod
+    def generate_command(dag_id,
+                         task_id,
+                         execution_date,
+                         mark_success=False,
+                         ignore_dependencies=False,
+                         ignore_depends_on_past=False,
+                         force=False,
+                         local=False,
+                         pickle_id=None,
+                         full_file_path=None,
+                         raw=False,
+                         job_id=None,
+                         pool=None
+                         ):
+        iso = execution_date.isoformat()
+        cmd = "airflow run {dag_id} {task_id} {iso} "
+        cmd += "--mark_success " if mark_success else ""
+        cmd += "--pickle {pickle_id} " if pickle_id else ""
+        cmd += "--job_id {job_id} " if job_id else ""
+        cmd += "-i " if ignore_dependencies else ""
+        cmd += "-I " if ignore_depends_on_past else ""
+        cmd += "--force " if force else ""
+        cmd += "--local " if local else ""
+        cmd += "--pool {pool} " if pool else ""
+        cmd += "--raw " if raw else ""
+        cmd += "-sd {full_file_path}"
         return cmd.format(**locals())
 
     @property

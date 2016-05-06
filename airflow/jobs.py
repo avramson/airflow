@@ -187,6 +187,70 @@ class BaseJob(Base, LoggingMixin):
         raise NotImplementedError("This method needs to be overridden")
 
 
+class TaskExecutionInfo(object):
+    def __init__(self, key, command, priority, queue):
+        self.key = key
+        self.command = command
+        self.priority = priority
+        self.queue = queue
+
+
+class ProcessDagFileResult(object):
+    def __init__(self, simple_dag_bag, task_execution_infos):
+        self.simple_dag_bag = simple_dag_bag
+        self.task_execution_infos = task_execution_infos
+
+
+class SimpleDag(object):
+    def __init__(self,
+                 dag_id,
+                 task_ids,
+                 full_file_path,
+                 task_concurrency_limit,
+                 is_paused,
+                 pickle_id):
+        self.dag_id = dag_id
+        self.task_ids = task_ids
+        self.full_file_path = full_file_path
+        self.is_paused = is_paused
+        self.task_concurrency_limit = task_concurrency_limit
+        self.pickle_id = pickle_id
+
+
+class SimpleDagBag(object):
+    def __init__(self, simple_dags):
+        self.simple_dags = simple_dags
+        self.dag_id_to_simple_dag = {}
+
+        for simple_dag in simple_dags:
+            self.dag_id_to_simple_dag[simple_dag.dag_id] = simple_dag
+
+    def is_paused(self, dag_id):
+        if dag_id not in self.dag_id_to_simple_dag:
+            raise AirflowException("Unknown DAG ID {}".format(dag_id))
+        return self.dag_id_to_simple_dag[dag_id].is_paused
+
+    def get_task_ids(self, dag_id):
+        if dag_id not in self.dag_id_to_simple_dag:
+            raise AirflowException("Unknown DAG ID {}".format(dag_id))
+        return self.dag_id_to_simple_dag[dag_id].task_ids
+
+    def get_full_file_path(self, dag_id):
+        if dag_id not in self.dag_id_to_simple_dag:
+            raise AirflowException("Unknown DAG ID {}".format(dag_id))
+        return self.dag_id_to_simple_dag[dag_id].full_file_path
+
+    def get_task_concurrency_limit(self, dag_id):
+        if dag_id not in self.dag_id_to_simple_dag:
+            raise AirflowException("Unknown DAG ID {}".format(dag_id))
+        return self.dag_id_to_simple_dag[dag_id].task_concurrency
+
+    def get_pickle_id(self, dag_id):
+        if dag_id not in self.dag_id_to_simple_dag:
+            raise AirflowException("Unknown DAG ID {}".format(dag_id))
+        return self.dag_id_to_simple_dag[dag_id].pickle_id
+
+
 class SchedulerJob(BaseJob):
     """
     This SchedulerJob runs indefinitely and constantly schedules the jobs
@@ -462,7 +526,7 @@ class SchedulerJob(BaseJob):
                 session.commit()
                 return next_run
 
-    def process_dag(self, dag, queue):
+    def original_process_dag(self, dag, queue):
         """
         This method schedules a single DAG by looking at the latest
         run for each task and attempting to schedule the following run.
@@ -559,7 +623,98 @@ class SchedulerJob(BaseJob):
 
         session.close()
 
-    def process_events(self, executor, dagbag):
+    def modified_process_dag(self, dag, queue):
+        """
+        This method schedules a single DAG by looking at the latest
+        run for each task and attempting to schedule the following run.
+
+        As multiple schedulers may be running for redundancy, this
+        function takes a lock on the DAG and timestamps the last run
+        in ``last_scheduler_run``.
+        """
+        TI = models.TaskInstance
+        DagModel = models.DagModel
+        session = settings.Session()
+
+        db_dag = session.query(DagModel).filter_by(dag_id=dag.dag_id).first()
+        last_scheduler_run = db_dag.last_scheduler_run or datetime(2000, 1, 1)
+        secs_since_last = (
+            datetime.now() - last_scheduler_run).total_seconds()
+        # if db_dag.scheduler_lock or
+        if secs_since_last < self.heartrate:
+            session.commit()
+            session.close()
+            return None
+        else:
+            # Taking a lock
+            db_dag.scheduler_lock = True
+            db_dag.last_scheduler_run = datetime.now()
+            session.commit()
+
+        active_runs = dag.get_active_runs()
+
+        self.logger.info('Getting list of tasks to skip for active runs.')
+        skip_tis = set()
+        if active_runs:
+            qry = (
+                session.query(TI.task_id, TI.execution_date)
+                    .filter(
+                    TI.dag_id == dag.dag_id,
+                    TI.execution_date.in_(active_runs),
+                    TI.state.in_((State.RUNNING, State.SUCCESS, State.FAILED)),
+                )
+            )
+            skip_tis = {(ti[0], ti[1]) for ti in qry.all()}
+
+        descartes = [obj for obj in product(dag.tasks, active_runs)]
+        could_not_run = set()
+        self.logger.info('Checking dependencies on {} tasks instances, minus {} '
+                         'skippable ones'.format(len(descartes), len(skip_tis)))
+
+        for task, dttm in descartes:
+            if task.adhoc or (task.task_id, dttm) in skip_tis:
+                continue
+            ti = TI(task, dttm)
+
+            ti.refresh_from_db()
+            if ti.state in (
+                    State.RUNNING, State.QUEUED, State.SUCCESS, State.FAILED):
+                continue
+            elif ti.is_runnable(flag_upstream_failed=True):
+                self.logger.debug('Queuing task: {}'.format(ti))
+                queue.put(ti.key)
+            else:
+                could_not_run.add(ti)
+
+        # this type of deadlock happens when dagruns can't even start and so
+        # the TI's haven't been persisted to the     database.
+        if len(could_not_run) == len(descartes) and len(could_not_run) > 0:
+            self.logger.error(
+                'Dag runs are deadlocked for DAG: {}'.format(dag.dag_id))
+            (session
+                .query(models.DagRun)
+                .filter(
+                models.DagRun.dag_id == dag.dag_id,
+                models.DagRun.state == State.RUNNING,
+                models.DagRun.execution_date.in_(active_runs))
+                .update(
+                {models.DagRun.state: State.FAILED},
+                synchronize_session='fetch'))
+
+        # Releasing the lock
+        self.logger.debug("Unlocking DAG (scheduler_lock)")
+        db_dag = (
+            session.query(DagModel)
+                .filter(DagModel.dag_id == dag.dag_id)
+                .first()
+        )
+        db_dag.scheduler_lock = False
+        session.merge(db_dag)
+        session.commit()
+
+        session.close()
+
+    def original_process_events(self, executor, dagbag):
         """
         Respond to executor events.
 
@@ -589,8 +744,22 @@ class SchedulerJob(BaseJob):
                 # special instructions for failed executions could go here
                 pass
 
+
+    def modified_process_events(self, executor, dagbag):
+        """
+        Respond to executor events.
+        """
+        for key, executor_state in list(executor.get_event_buffer().items()):
+            dag_id, task_id, execution_date = key
+            self.logger.info("Executor reports {}.{} execution_date={} as {}",
+                             dag_id,
+                             task_id,
+                             execution_date,
+                             executor_state)
+
+
     @provide_session
-    def prioritize_queued(self, session, executor, dagbag):
+    def original_prioritize_queued(self, session, executor, dagbag):
         # Prioritizing queued task instances
 
         pools = {p.pool: p for p in session.query(models.Pool).all()}
@@ -673,6 +842,233 @@ class SchedulerJob(BaseJob):
 
                 session.commit()
 
+    @provide_session
+    def delete_defunct_queued_task_instances(self, session, simple_dagbag):
+        """Queries the ORM for task instances in the queued state and deletes
+        ones that correspond to a known definition in the SimpleDagBag"""
+        TI = models.TaskInstance
+        queued_task_instances = (
+            session
+                .query(TI)
+                .filter(TI.state == State.QUEUED)
+                .all()
+        )
+        for task_instance in queued_task_instances:
+            if (simple_dagbag.exists(task_instance.dag_id, task_instance.task_id)):
+                self.logger.error("Deleting {} as it does not have a "
+                                  "corresponding task in the dagbag."
+                                  .format(task_instance))
+            session.delete(task_instance)
+        session.commit()
+
+    def get_task_concurrency(self, session, dag_id, task_ids):
+        """
+        Returns the number of tasks running in the given DAG
+        """
+        TI = models.TaskInstance
+        qry = session.query(func.count(TI.task_id)).filter(
+            TI.dag_id == dag_id,
+            TI.task_id.in_(task_ids),
+            TI.state == State.RUNNING,
+        )
+        return qry.scalar()
+
+    @provide_session
+    def execute_queued_task_instances(self,
+                                      session,
+                                      executor,
+                                      simple_dag_bag,
+                                      task_execution_infos=TaskExecutionInfo()):
+        """Fetches task instances from ORM, figures out pool limits, and
+        sends them to the executor for execution"""
+        # Get all the queued task instances
+        TI = models.TaskInstance
+        queued_task_instances = (
+            session
+                .query(TI)
+                .filter(TI.state == State.QUEUED)
+                .all()
+        )
+
+        # Get the pool settings
+        pools = {p.pool: p for p in session.query(models.Pool).all()}
+
+        pool_to_task_instances = defaultdict(list)
+        for task_instance in queued_task_instances:
+                pool_to_task_instances[task_instance.pool].append(task_instance)
+
+        # Go through each pool, and queue up a task for execution if there are
+        # slots open in the pool.
+        for pool, task_instances in list(pool_to_task_instances):
+            self.logger.info("Processing tasks for pool={}".format(pool))
+            if not pool:
+                # Arbitrary:
+                # If queued outside of a pool, trigger no more than
+                # non_pooled_task_slot_count per run
+                open_slots = conf.getint('core', 'non_pooled_task_slot_count')
+            else:
+                open_slots = pools[pool].open_slots(session=session)
+
+            num_queued = len(task_instances)
+            self.logger.info("Pool {pool} has {open_slots} slots with {num_queued} "
+                             "task instances in queue".format(**locals()))
+
+            if open_slots <= 0:
+                continue
+
+            priority_sorted_task_instances = sorted(
+                task_instances, key=lambda ti: (-ti.priority_weight, ti.start_date))
+
+            # DAG IDs with running tasks that equal the concurrency limit of the dag
+            dag_ids_at_max_concurrency = []
+
+            for task_instance in priority_sorted_task_instances:
+                if open_slots <= 0:
+                    # Can't schedule any more since there are no more open slots.
+                    break
+
+                if simple_dag_bag.is_paused(task_instance.dag_id):
+                    self.logger.info("Not executing queued {} since {} is paused"
+                                     .format(task_instance, task_instance.dag_id))
+                    continue
+
+                dag_id = task_instance.dag_id
+                task_concurrency_limit = simple_dag_bag.get_task_concurrency_limit(dag_id)
+
+                # Checking the task concurrency for the DAG could be expensive?
+                if (dag_id in dag_ids_at_max_concurrency or
+                        self.get_task_concurrency(session,
+                                                  dag_id,
+                                                  simple_dag_bag.get_tasks_ids(dag_id)) >
+                        task_concurrency_limit):
+                    dag_ids_at_max_concurrency.append(dag_id)
+                    self.logger.info("Not executing queued {} since the number "
+                                     "of tasks running from DAG {} exceeds the "
+                                     "DAG's concurrency limit of {}"
+                                     .format(task_instance, dag_id, task_concurrency_limit))
+                    continue
+
+                if not task_instance.are_dependencies_met():
+                    # A queued task instance may not have its dependencies met if the DAG definition
+                    # has changed.
+                    self.logger.info("Deleting queued {} as the dependencies are not met")
+                    session.delete(task_instance)
+                    continue
+
+                # Nothing is blocking this task from running, so send it to the executor.
+                # executor.queue_task_instance(task_instance, pickle_id=pickle_id)
+                # TODO: Should the pickle ID be a part of the task instance?
+                # TODO: Should this use TaskInstance.priority_weight_total?
+                command = TI.generate_command(
+                    task_instance.dag_id,
+                    task_instance.task_id,
+                    task_instance.execution_date,
+                    local=True,
+                    mark_success=False,
+                    force=False,
+                    ignore_dependencies=False,
+                    ignore_depends_on_past=False,
+                    pool=task_instance.pool,
+                    pickle_id=simple_dag_bag.get_pickle_id(task_instance.dag_id, task_instance.task_id))
+
+                priority = task_instance.priority_weight
+                queue = task_instance.queue
+                self.logger.info("Sending to executor {} with priority {} and queue {}"
+                                 .format(task_instance.key, priority, queue ))
+                executor.queue_command(
+                    task_instance.key,
+                    command,
+                    priority=priority,
+                    queue=queue)
+
+                open_slots -= 1
+
+
+    @provide_session
+    def prioritize_queued(self, session, queued_tis, executor, dagbag):
+        # Prioritizing queued task instances
+
+        pools = {p.pool: p for p in session.query(models.Pool).all()}
+
+        self.logger.info(
+            "Prioritizing {} queued jobs".format(len(self.queued_tis)))
+        session.expunge_all()
+        d = defaultdict(list)
+        for ti in queued_tis:
+            if ti.dag_id not in dagbag.dags:
+                self.logger.info(
+                    "DAG no longer in dagbag, deleting {}".format(ti))
+                session.delete(ti)
+                session.commit()
+            elif not dagbag.dags[ti.dag_id].has_task(ti.task_id):
+                self.logger.info(
+                    "Task no longer exists, deleting {}".format(ti))
+                session.delete(ti)
+                session.commit()
+            else:
+                d[ti.pool].append(ti)
+
+        self.queued_tis.clear()
+
+        dag_blacklist = set(dagbag.paused_dags())
+        for pool, tis in list(d.items()):
+            if not pool:
+                # Arbitrary:
+                # If queued outside of a pool, trigger no more than
+                # non_pooled_task_slot_count per run
+                open_slots = conf.getint('core', 'non_pooled_task_slot_count')
+            else:
+                open_slots = pools[pool].open_slots(session=session)
+
+            queue_size = len(tis)
+            self.logger.info("Pool {pool} has {open_slots} slots, {queue_size} "
+                             "task instances in queue".format(**locals()))
+            if open_slots <= 0:
+                continue
+            tis = sorted(
+                tis, key=lambda ti: (-ti.priority_weight, ti.start_date))
+            for ti in tis:
+                if open_slots <= 0:
+                    continue
+                task = None
+                try:
+                    task = dagbag.dags[ti.dag_id].get_task(ti.task_id)
+                except:
+                    self.logger.error("Queued task {} seems gone".format(ti))
+                    session.delete(ti)
+                    session.commit()
+                    continue
+
+                if not task:
+                    continue
+
+                ti.task = task
+
+                # picklin'
+                dag = dagbag.dags[ti.dag_id]
+                pickle_id = None
+                if self.do_pickle and self.executor.__class__ not in (
+                        executors.LocalExecutor,
+                        executors.SequentialExecutor):
+                    self.logger.info("Pickling DAG {}".format(dag))
+                    pickle_id = dag.pickle(session).id
+
+                if dag.dag_id in dag_blacklist:
+                    continue
+                if dag.concurrency_reached:
+                    dag_blacklist.add(dag.dag_id)
+                    continue
+                if ti.are_dependencies_met():
+                    executor.queue_task_instance(ti, pickle_id=pickle_id)
+                    open_slots -= 1
+                else:
+                    session.delete(ti)
+                    continue
+                ti.task = task
+
+                session.commit()
+
+
     def _split_dags(self, dags, size):
         """
         This function splits a list of dags into chunks of int size.
@@ -692,12 +1088,12 @@ class SchedulerJob(BaseJob):
                 continue
             try:
                 self.schedule_dag(dag)
-                self.process_dag(dag, tis_out)
+                self.modified_process_dag(dag, tis_out)
                 self.manage_slas(dag)
             except Exception as e:
                 self.logger.exception(e)
 
-    def _execute(self):
+    def _execute_modified(self):
         pessimistic_connection_handling()
 
         logging.basicConfig(level=logging.DEBUG)
@@ -709,13 +1105,60 @@ class SchedulerJob(BaseJob):
         executor.start()
 
         self.runs = 0
+
+        # DAGs can be pickled for easier remote execution by some executors
+        pickle_dags = False
+        if self.do_pickle and self.executor.__class__ not in (
+               executors.LocalExecutor, executors.SequentialExecutor):
+            pickle_dags = True
+
         while not self.num_runs or self.num_runs > self.runs:
             self.runs += 1
             loop_start_dttm = datetime.now()
             try:
+                results = []
+
+                # Read each file for DAGs, figure out the tasks that can be
+                # run, and create those task instances in the ORM
                 for file_path in file_paths:
-                    self.logger.info("Scheduling DAGs in file {}".format(file_path))
-                    self._schedule_one_file(file_path, executor)
+                    self.logger.info("Processing DAGs in file {}".format(file_path))
+                    result = self._process_dags_in_one_file(file_path, executor, pickle_dags)
+                    results.append(result)
+
+                # Combine the SimpleDagBags and TaskExecutionInfos from each file
+                all_simple_dags = []
+                all_task_execution_infos = []
+                for result in results:
+                    all_simple_dags.extend(result.simple_dag_bag.simple_dags)
+                    all_task_execution_infos.extend(result.task_execution_infos)
+                simple_dag_bag = SimpleDagBag(all_simple_dags)
+
+
+                # Before scheduling any tasks, delete any queued instances
+                # that are not a part of any known DAG. They may be defunct
+                # because they were created with an earlier version of a DAG,
+                # or the DAG was deleted after the tasks were created.
+                self.delete_defunct_queued_task_instances(simple_dag_bag)
+
+                # All tasks should exist in the ORM in the queued state at
+                # this point, so it's possible to prioritize based on the
+                # pool and execute them.
+                self.logger.info("Examining queued tasks and sending to the "
+                                 "executor")
+                self.execute_queued_task_instances(executor, simple_dag_bag)
+
+                self.logger.info("Heartbeating the executor")
+                duration_sec = (datetime.now() - loop_start_dttm).total_seconds()
+                self.logger.info("Loop took: {} seconds".format(duration_sec))
+
+                try:
+                    # We really just want the scheduler to never ever stop.
+                    executor.heartbeat()
+                    self.heartbeat()
+                except Exception as e:
+                    self.logger.exception(e)
+                    self.logger.error("Tachycardia!")
+
             except Exception as deep_e:
                 self.logger.exception(deep_e)
                 raise
@@ -723,9 +1166,117 @@ class SchedulerJob(BaseJob):
                 settings.Session.remove()
         executor.end()
 
-    def _schedule_one_file(self, file_path, executor):
-        dagbag = models.DagBag(file_path, sync_to_db=True)
+    @provide_session
+    def _process_dags_in_one_file(self, session, file_path, pickle_dags=True):
+        """Loads the specified file and for each dag in the file, pickle
+        the dag, figure out what tasks can be run, and create respective task
+        instances in the ORM"""
+
+        # As DAGs are parsed from this file, they will be converted into SimpleDags
+        simple_dags = []
+        task_execution_infos = []
+        try:
+            TI = models.TaskInstance
+
+            try:
+                dagbag = models.DagBag(file_path, sync_to_db=True)
+            except Exception as e:
+                self.logger.error("Failed at reloading the DAG file {}".format(file_path))
+                Stats.incr('dag_file_refresh_error', 1, 1)
+                return ProcessDagFileResult([], [])
+
+            # Pickle the DAGs (if necessary) and put them into a SimpleDag
+            for dag in dagbag.dags:
+                pickle_id = None
+                if pickle_dags:
+                    pickle_id = dag.pickle(session).id
+
+                task_ids = [task.task_id for task in dag.tasks]
+                simple_dags.append(SimpleDag(dag.dag_id,
+                                             task_ids,
+                                             dag.full_filepath,
+                                             dag.concurrency,
+                                             dag.is_paused,
+                                             pickle_id))
+            simple_dag_bag = SimpleDagBag(simple_dags)
+
+            if len(self.dag_ids) > 0:
+                dags = [dag for dag in dagbag.dags.values() if dag.dag_id in self.dag_ids]
+            else:
+                dags = [
+                    dag for dag in dagbag.dags.values()
+                    if not dag.parent_dag]
+
+            tis_q = multiprocessing.Queue()
+
+            for dag in dags:
+                logging.info("Generating new task instances for DAG ID {}".format(dag.dag_id))
+                self._do_dags(dagbag, dags, tis_q)
+
+            #pickle_id = None
+            #if self.do_pickle and self.executor.__class__ not in (
+            #        executors.LocalExecutor, executors.SequentialExecutor):
+            #    pickle_id = dag.pickle(session).id
+
+            while not tis_q.empty():
+                ti_key = tis_q.get()
+                dag = dagbag.dags[ti_key[0]]
+                task = dag.get_task(ti_key[1])
+                ti = TI(task, ti_key[2])
+                # Task starts out in the queued state. All tasks in the queued
+                # state will be scheduled later in the execution loop.
+                ti.state = State.QUEUED
+                pool = ti.pool
+                pickle_id = simple_dag_bag.get_pickle_id(dag.dag_id)
+
+                command = ti.command(
+                    local=True,
+                    mark_success=False,
+                    force=False,
+                    ignore_dependencies=False,
+                    ignore_depends_on_past=False,
+                    pool=pool,
+                    pickle_id=pickle_id)
+
+                task_execution_infos.append(TaskExecutionInfo(
+                    ti.key,
+                    command,
+                    ti.task.priority_weight_total,
+                    ti.task.queue))
+
+                # Also save this task instance to the DB.
+                self.logger.info("Creating {} in ORM".format(ti))
+                session.add(ti)
+                session.commit()
+
+            # Record import errors into the ORM
+            try:
+                self.import_errors(dagbag)
+            except Exception as e:
+                self.logger.exception("Error logging import errors!")
+            try:
+                dagbag.kill_zombies()
+            except Exception as e:
+                self.logger.exception("Error killing zombies!")
+
+            return ProcessDagFileResult(simple_dag_bag, task_execution_infos)
+        finally:
+            # TODO: Figure out if this works in multiprocessing mode
+            # TODO: Should this be moved to _execute()?
+            settings.Session.remove()
+
+    # This is the modified _execute()
+    def _execute(self):
         TI = models.TaskInstance
+
+        pessimistic_connection_handling()
+
+        logging.basicConfig(level=logging.DEBUG)
+        self.logger.info("Starting the scheduler")
+
+        dagbag = models.DagBag(self.subdir, sync_to_db=True)
+        executor = self.executor = dagbag.executor
+        executor.start()
         self.runs = 0
         while not self.num_runs or self.num_runs > self.runs:
             try:
@@ -774,10 +1325,6 @@ class SchedulerJob(BaseJob):
                 for j in jobs:
                     j.join()
 
-                for dag in dags:
-                    logging.info("Scheduling DAG ID {}".format(dag))
-                    self._do_dags(dagbag, dags, tis_q)
-
                 while not tis_q.empty():
                     ti_key, pickle_id = tis_q.get()
                     dag = dagbag.dags[ti_key[0]]
@@ -786,7 +1333,7 @@ class SchedulerJob(BaseJob):
                     self.executor.queue_task_instance(ti, pickle_id=pickle_id)
 
                 self.logger.info("Done queuing tasks, calling the executor's "
-                              "heartbeat")
+                                 "heartbeat")
                 duration_sec = (datetime.now() - loop_start_dttm).total_seconds()
                 self.logger.info("Loop took: {} seconds".format(duration_sec))
                 try:
