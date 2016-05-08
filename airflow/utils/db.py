@@ -197,7 +197,13 @@ def initdb():
         session.add(KET(know_event_type='Marketing Campaign'))
     session.commit()
 
-    models.DagBag(sync_to_db=True)
+    dagbag = models.DagBag()
+    # Save individual DAGs in the ORM
+    for dag in dagbag.dags:
+        models.DAG.sync_to_db(dag)
+    # Deactivate the unknown ones
+    active_dag_ids = [dag.dag_id for dag in dagbag.dags]
+    models.DAG.deactivate_unknown_dags(active_dag_ids)
 
     Chart = models.Chart
     chart_label = "Airflow task instance by type"

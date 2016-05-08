@@ -20,6 +20,7 @@ class SequentialExecutor(BaseExecutor):
 
     def execute_async(self, key, command, queue=None):
         self.commands_to_run.append((key, command,))
+        self.sync()
 
     def sync(self):
         for key, command in self.commands_to_run:

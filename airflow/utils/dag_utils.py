@@ -28,3 +28,4 @@ def list_py_file_paths(directory):
                         file_paths.append(file_path)
                 except Exception as e:
                     logging.exception("Error while examining {}".format(f))
+    return file_paths
