@@ -286,20 +286,33 @@ def launch_process_to_process_file(thread_name,
                                    args):
 
     def helper(h_result_queue, h_file_path, h_pickle_dags):
-        threading.current_thread().name = thread_name
-        start_time = time.time()
-        scheduler_job = SchedulerJob()
-        reload(settings)
-        h_result_queue.put(
-            scheduler_job.process_dags_in_one_file(h_file_path,
-                                                   h_pickle_dags))
-        end_time = time.time()
-        logging.info("Processing {} took {:.3f} seconds"
-                     .format(h_file_path,
-                             end_time - start_time))
+        added_to_queue = False
+        try:
+            threading.current_thread().name = thread_name
+            start_time = time.time()
+            scheduler_job = SchedulerJob()
+            reload(settings)
+
+            # TODO: Put here to prevent GC?
+            result = scheduler_job.process_dags_in_one_file(h_file_path,
+                                                       h_pickle_dags)
+            h_result_queue.put(result)
+            added_to_queue = True
+            end_time = time.time()
+            logging.info("Processing {} took {:.3f} seconds"
+                         .format(h_file_path,
+                                 end_time - start_time))
+        finally:
+            # Returning something in the queue is how the parent proecss knows
+            # that this process is done
+            if not added_to_queue:
+                logging.info("Putting none into queue as no value was returned")
+                h_result_queue.put(None)
+
 
     p = multiprocessing.Process(target=helper, args=args)
-    # Set it to daemon so that we try to kill on exit
+    p.name = "{}-Process".format(thread_name)
+    # Set it to daemon so that we try to kill the process on exit
     p.daemon = True
     p.start()
     return p
@@ -1326,10 +1339,25 @@ class SchedulerJob(BaseJob):
                     filtered_processes = []
                     for process, queue in alive_processes:
                         # It's possible for process to be blocked waiting for the queue to empty?
-                        if not queue.empty():
-                            results.append(queue.get_nowait())
+                        process_finished = False
+
+                        # TODO: There shouldn't be more than one entry
+                        results_from_queue = []
+                        while not queue.empty():
+                            results_from_queue.append(queue.get_nowait())
+
+                        if len(results_from_queue) > 1:
+                            logging.error("Too many results from the queue {} from"
+                                          .format(results_from_queue, process.name))
+
+                        if len(results_from_queue) > 0:
                             finished_count += 1
-                        if process.is_alive():
+                            process_finished = True
+                            results.extend(results_from_queue)
+
+                        # TODO: Remember race condition when a process generates and finishes an entry
+                        # between calls to queue.empty() and removal from filtered_processes
+                        if not process_finished:
                             filtered_processes.append((process, queue))
                         # else:
                         #     # TODO: It should never be empty?
