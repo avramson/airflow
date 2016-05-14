@@ -20,6 +20,7 @@ from __future__ import unicode_literals
 from past.builtins import basestring
 from collections import defaultdict, Counter
 from datetime import datetime
+from datetime import timedelta
 from itertools import product
 
 import getpass
@@ -29,6 +30,7 @@ import subprocess
 import multiprocessing
 import multiprocessing.dummy
 import math
+import os
 import time
 from time import sleep
 
@@ -284,69 +286,87 @@ class SimpleDagBag(object):
         return len(self.dag_id_to_simple_dag)
 
 
-def _old_launch_process_to_process_file(thread_name,
-                                   args):
+# def _old_launch_process_to_process_file(thread_name,
+#                                    args):
+#
+#     def helper(h_result_queue, h_file_path, h_pickle_dags):
+#         added_to_queue = False
+#         try:
+#             threading.current_thread().name = thread_name
+#             start_time = time.time()
+#             scheduler_job = SchedulerJob()
+#             reload(settings)
+#
+#             # TODO: Put here to prevent GC?
+#             result = scheduler_job.process_dags_in_one_file(h_file_path,
+#                                                        h_pickle_dags)
+#             h_result_queue.put(result)
+#             added_to_queue = True
+#             end_time = time.time()
+#             logging.info("Processing {} took {:.3f} seconds"
+#                          .format(h_file_path,
+#                                  end_time - start_time))
+#         finally:
+#             # Returning something in the queue is how the parent proecss knows
+#             # that this process is done
+#             if not added_to_queue:
+#                 logging.info("Putting none into queue as no value was returned")
+#                 h_result_queue.put(None)
+#
+#     p = multiprocessing.Process(target=helper, args=args)
+#     p.name = "{}-Process".format(thread_name)
+#     # Set it to daemon so that we try to kill the process on exit
+#     p.daemon = True
+#     p.start()
+#     return p
 
-    def helper(h_result_queue, h_file_path, h_pickle_dags):
-        added_to_queue = False
-        try:
-            threading.current_thread().name = thread_name
-            start_time = time.time()
-            scheduler_job = SchedulerJob()
-            reload(settings)
-
-            # TODO: Put here to prevent GC?
-            result = scheduler_job.process_dags_in_one_file(h_file_path,
-                                                       h_pickle_dags)
-            h_result_queue.put(result)
-            added_to_queue = True
-            end_time = time.time()
-            logging.info("Processing {} took {:.3f} seconds"
-                         .format(h_file_path,
-                                 end_time - start_time))
-        finally:
-            # Returning something in the queue is how the parent proecss knows
-            # that this process is done
-            if not added_to_queue:
-                logging.info("Putting none into queue as no value was returned")
-                h_result_queue.put(None)
-
-    p = multiprocessing.Process(target=helper, args=args)
-    p.name = "{}-Process".format(thread_name)
-    # Set it to daemon so that we try to kill the process on exit
-    p.daemon = True
-    p.start()
-    return p
 
 def launch_process_to_process_file(result_queue,
                                    file_path,
                                    pickle_dags,
-                                   thread_name):
-    def helper(h_result_queue, h_file_path, h_pickle_dags):
+                                   thread_name,
+                                   log_file):
+    def helper(h_result_queue, h_file_path, h_pickle_dags, h_log_file):
         added_to_queue = False
         try:
-            threading.current_thread().name = thread_name
-            start_time = time.time()
-            scheduler_job = SchedulerJob()
-            reload(settings)
+            # Re-direct stdout and stderr to the log file for this
+            # child process. No buffering to enable responsive file tailing
+            parent_dir, file = os.path.split(h_log_file)
+            try:
+                os.makedirs(parent_dir)
+            except os.error as e:
+                # Throws error when directly already exists
+                pass
 
-            # TODO: Put here to prevent GC?
-            result = scheduler_job.process_dags_in_one_file(h_file_path,
-                                                            h_pickle_dags)
-            h_result_queue.put(result)
-            added_to_queue = True
-            end_time = time.time()
-            logging.info("Processing {} took {:.3f} seconds"
-                         .format(h_file_path,
-                                 end_time - start_time))
+            with open(h_log_file, "a", buffering=0) as f:
+                sys.stdout = f
+                sys.stderr = sys.stdout
+
+                threading.current_thread().name = thread_name
+                start_time = time.time()
+
+                reload(settings)
+
+                print("Process(PID={}) working on {}".format(os.getpid(), h_file_path))
+                scheduler_job = SchedulerJob()
+                result = scheduler_job.process_dags_in_one_file(h_file_path,
+                                                                h_pickle_dags)
+                h_result_queue.put(result)
+                added_to_queue = True
+                end_time = time.time()
+                logging.info("Processing {} took {:.3f} seconds"
+                             .format(h_file_path,
+                                     end_time - start_time))
         finally:
             # Returning something in the queue is how the parent process knows
             # that this is done
             if not added_to_queue:
                 logging.info("Putting none into queue as no value was returned")
                 h_result_queue.put(None)
-
-    p = multiprocessing.Process(target=helper, args=(result_queue, file_path, pickle_dags))
+    p = multiprocessing.Process(target=helper, args=(result_queue,
+                                                     file_path,
+                                                     pickle_dags,
+                                                     log_file))
     p.name = "{}-Process".format(thread_name)
     # Set it to daemon so that we try to kill the process on exit
     p.daemon = True
@@ -357,7 +377,7 @@ def launch_process_to_process_file(result_queue,
 class DagFileProcessor(object):
     create_counter = 0
 
-    def __init__(self, file_path, pickle_dags):
+    def __init__(self, file_path, pickle_dags, log_file):
         self.file_path = file_path
         self._result_queue = multiprocessing.Queue()
         self._process = None
@@ -366,6 +386,7 @@ class DagFileProcessor(object):
         self._result = None
         self._done = False
         self._start_time = None
+        self._log_file = log_file
         DagFileProcessor.create_counter += 1
 
     def start(self):
@@ -373,7 +394,8 @@ class DagFileProcessor(object):
             self._result_queue,
             self.file_path,
             self._pickle_dags,
-            "DagFileProcessor{}".format(self.create_counter))
+            "DagFileProcessor{}".format(self.create_counter),
+            self._log_file)
         self._start_time = datetime.now()
 
     def stop(self):
@@ -453,7 +475,6 @@ class SchedulerJob(BaseJob):
             num_runs=None,
             do_pickle=False,
             *args, **kwargs):
-
         # for BaseJob compatibility
         self.dag_id = dag_id
         self.dag_ids = [dag_id] if dag_id else []
@@ -815,24 +836,24 @@ class SchedulerJob(BaseJob):
         DagModel = models.DagModel
         session = settings.Session()
 
-        db_dag = session.query(DagModel).filter_by(dag_id=dag.dag_id).first()
-        if db_dag and db_dag.last_scheduler_run:
-            last_scheduler_run = db_dag.last_scheduler_run
-        else:
-            last_scheduler_run = datetime(2000, 1, 1)
-
-        secs_since_last = (
-            datetime.now() - last_scheduler_run).total_seconds()
-        # if db_dag.scheduler_lock or
-        if secs_since_last < self.heartrate:
-            session.commit()
-            session.close()
-            return None
-        else:
-            # Taking a lock
-            db_dag.scheduler_lock = True
-            db_dag.last_scheduler_run = datetime.now()
-            session.commit()
+        # db_dag = session.query(DagModel).filter_by(dag_id=dag.dag_id).first()
+        # if db_dag and db_dag.last_scheduler_run:
+        #     last_scheduler_run = db_dag.last_scheduler_run
+        # else:
+        #     last_scheduler_run = datetime(2000, 1, 1)
+        #
+        # secs_since_last = (
+        #     datetime.now() - last_scheduler_run).total_seconds()
+        # # if db_dag.scheduler_lock or
+        # if secs_since_last < self.heartrate:
+        #     session.commit()
+        #     session.close()
+        #     return None
+        # else:
+        #     # Taking a lock
+        #     db_dag.scheduler_lock = True
+        #     db_dag.last_scheduler_run = datetime.now()
+        #     session.commit()
 
         active_runs = dag.get_active_runs()
 
@@ -859,11 +880,15 @@ class SchedulerJob(BaseJob):
                 continue
             ti = TI(task, dttm)
 
+            self.logger.info("Examining {}".format(ti))
             ti.refresh_from_db()
             if ti.state in (
                     State.RUNNING, State.QUEUED, State.SUCCESS, State.FAILED):
                 # Can state be None? State can be none if the task hasn't been created yet
-                # If it's up for retry, ti.is_runnable can return false but it's not really deadlocked
+                # If it's up for retry, ti.is_runnable can return false but it's not really
+                #  deadlocked
+                # TODO: Remove me
+                self.logger.info("Skipping because of state")
                 continue
             elif ti.is_runnable(flag_upstream_failed=True):
                 self.logger.debug('Queuing task: {}'.format(ti))
@@ -1350,7 +1375,12 @@ class SchedulerJob(BaseJob):
         headers = ["File Path", "Processed Cycles", "Avg. Cycle Time"]
         rows = []
         for file_path, count in processed_counts.items():
-            rows.append((file_path, count, "{:.2f}s".format(elapsed_time / count)))
+            rows.append((file_path,
+                         count,
+                         "{:.2f}s".format(elapsed_time / count if count else 0)))
+
+        # Sort by the average cycle time
+        sorted(rows, key=lambda x: x[2])
         log_str = ("\n" +
                    "=" * 80 +
                    "\n" +
@@ -1360,6 +1390,30 @@ class SchedulerJob(BaseJob):
                    "=" * 80)
 
         self.logger.info(log_str)
+
+    @staticmethod
+    def split_path(file_path):
+        results = []
+        while True:
+            head, tail = os.path.split(file_path)
+            if len(tail) != 0:
+                results.append(tail)
+            if file_path == head:
+                break;
+            file_path = head
+        results.reverse()
+        return results
+
+    def get_log_file_path(self, dag_file_path):
+        # TODO: Make configurable
+        log_directory = u"/tmp/airflow/logs/"
+        relative_dag_file_path = os.path.relpath(dag_file_path, start=self.subdir)
+        path_elements = (SchedulerJob.split_path(relative_dag_file_path))
+
+        # Add a .log suffix for the log file
+        path_elements[-1] += ".log"
+
+        return os.path.join(log_directory, *path_elements)
 
     # This is the modified _execute()
     def _execute(self):
@@ -1381,18 +1435,22 @@ class SchedulerJob(BaseJob):
 
         # How long to run this method for for and when we started
         #loop_time_limit = 15 * 60;
-        execute_time_limit = 30
-        execute_start_time = time.time()
+        execute_time_limit = timedelta(minutes=30)
+        execute_start_time = datetime.now()
 
         # How frequently to refresh the known file paths in the DAG directory
         # and when we last refreshed
-        dag_dir_refresh_interval = 5 * 60.0;
-        last_dag_dir_refresh_time = 0.0;
+        dag_dir_refresh_interval = timedelta(minutes=5)
+        last_dag_dir_refresh_time = datetime(2000, 1, 1)
 
         # How frequently to print out DAG processing stats
-        # and when we last refreshed
-        stat_print_interval = 10.0
-        last_stat_print_time = 0.0;
+        # and when we last printed them
+        stat_print_interval = timedelta(seconds=10)
+        last_stat_print_time = datetime(2000, 1, 1)
+
+        # Deactivate DAGs that haven't been updated by the scheduler
+        # for this long
+        expiration_age = timedelta(minutes=60)
 
         # Use multiple processes to parse and generate tasks for the
         # DAGs in parallel. By processing them in separate processes,
@@ -1405,6 +1463,8 @@ class SchedulerJob(BaseJob):
         known_file_paths = []
         file_paths_queue = []
         processors = []
+        # Map between a file path, and the DAG IDs in that file
+        file_path_to_dag_ids = defaultdict(list)
 
         # Map from the file path to the number of times it's been processed
         processed_counts = defaultdict(int)
@@ -1413,12 +1473,12 @@ class SchedulerJob(BaseJob):
                               "=" * 80 +
                               "\nStarting loop at {}:\n" +
                               "=" * 80)
-        while time.time() - execute_start_time < execute_time_limit:
+        while datetime.now() - execute_start_time < execute_time_limit:
             loop_start_time = time.time()
             self.logger.info(loop_start_log_str.format(datetime.now().isoformat()))
             # Traverse the DAG directory for Python files containing DAGs
             # on first pass / refresh the list of file paths periodically
-            if time.time() - last_dag_dir_refresh_time > dag_dir_refresh_interval:
+            if datetime.now() - last_dag_dir_refresh_time > dag_dir_refresh_interval:
                 # Build up a list of Python files that could contain DAGs
                 self.logger.info("Searching for files in {}".format(self.subdir))
                 known_file_paths = dag_utils.list_py_file_paths(self.subdir)
@@ -1437,39 +1497,17 @@ class SchedulerJob(BaseJob):
                                      .format(processor.file_path))
                     processor.stop()
                 processors = processors_to_retain
-                last_dag_dir_refresh_time = time.time()
 
-            # Generate the list of file paths to process / reprocess the
-            # files again if the previous batch is done
-            if len(file_paths_queue) == 0:
-                self.logger.info("Queuing the following files for processing:\n\t{}"
-                                 .format("\n\t".join(known_file_paths)))
-                file_paths_queue.extend(known_file_paths)
+                # Also, if a file has been deleted, remove it from the file path ->
+                # DAG IDs mapping
+                file_path_to_dag_ids = {k: v for k, v in file_path_to_dag_ids.items()
+                                        if k in known_file_paths}
+                # Set the known DAG IDs to None if they don't exist
+                for file_path in known_file_paths:
+                    if file_path not in file_path_to_dag_ids:
+                        file_path_to_dag_ids[file_path] = None
 
-            # Start more processors if we can
-            file_paths_in_progress = [x.file_path for x in processors]
-            while parallelism - len(processors) > 0 and len(file_paths_queue) > 0:
-                file_path = file_paths_queue.pop(0)
-
-                # If the file path is already being processed, wait until the next batch
-                if file_path in file_paths_in_progress:
-                    matching_processors = [x for x in processors if x.file_path == file_path]
-                    if len(matching_processors) != 1:
-                        raise AirflowException("Invalid number of processors with a "
-                                               "matching file path: {}"
-                                               .format(matching_processors))
-                    slow_processor = matching_processors[0]
-
-                    self.logger.warn("Would generated tasks for {} again, but it's still "
-                                     "running from when it was started at {}"
-                                     .format(file_path,
-                                             slow_processor.start_time.isoformat()))
-                    continue
-                processor = DagFileProcessor(file_path, pickle_dags)
-                self.logger.info("Starting a process to generate tasks for {}"
-                                 .format(file_path))
-                processor.start()
-                processors.append(processor)
+                last_dag_dir_refresh_time = datetime.now()
 
             # Remove the processors that have finished
             finished_processors = []
@@ -1486,7 +1524,8 @@ class SchedulerJob(BaseJob):
             for processor in finished_processors:
                 processed_counts[processor.file_path] += 1
 
-            # Create a Simple DAG bag from the DAGs that were parsed out so we can send it to the  later
+            # Create a Simple DAG bag from the DAGs that were parsed so we
+            # can tell the executor tasks from which DAGs need to be run
             simple_dags = []
             for processor in finished_processors:
                 for simple_dag in processor.result.simple_dag_bag.simple_dags:
@@ -1498,17 +1537,55 @@ class SchedulerJob(BaseJob):
                 self.execute_task_instances(executor,
                                             simple_dag_bag,
                                             (State.QUEUED, State.UP_FOR_RETRY))
-            else:
-                self.logger.info("No tasks to send to the executor")
+
+            # Generate the list of file paths to process / reprocess the
+            # files again if the previous batch is done
+            if len(file_paths_queue) == 0:
+                # If the file path is already being processed, wait until the next batch
+                file_paths_in_progress = [x.file_path for x in processors]
+                files_paths_to_queue = list(set(known_file_paths) - set(file_paths_in_progress))
+
+                for processor in processors:
+                    self.logger.info("File path {} is still being processed (started: {})"
+                                     .format(processor.file_path,
+                                             processor.start_time.isoformat()))
+
+                self.logger.info("Queuing the following files for processing:\n\t{}"
+                                 .format("\n\t".join(files_paths_to_queue)))
+                file_paths_queue.extend(files_paths_to_queue)
+
+            # Start more processors if we can
+            while parallelism - len(processors) > 0 and len(file_paths_queue) > 0:
+                file_path = file_paths_queue.pop(0)
+                log_file_path = self.get_log_file_path(file_path)
+                processor = DagFileProcessor(file_path, pickle_dags, log_file_path)
+                self.logger.info("Starting a process to generate tasks for {} - logging into {}"
+                                 .format(file_path, log_file_path))
+                processor.start()
+                processors.append(processor)
+
             # Occasionally print out stats about how fast the files are getting processed
-            if time.time() - last_stat_print_time > stat_print_interval:
+            if datetime.now() - last_stat_print_time > stat_print_interval:
                 if len(processed_counts) > 0:
                     self.log_file_processing_stats(processed_counts,
-                                                   time.time() - execute_start_time)
-                last_stat_print_time = time.time()
+                                                   (datetime.now() - execute_start_time).total_seconds())
+                last_stat_print_time = datetime.now()
+
+            # Once the scheduler has been running long enough to ensure all files
+            # have been processed, deactivate DAGs that haven't been touched by
+            # the scheduler as they were likely deleted
+            if datetime.now() - execute_start_time > expiration_age:
+                expiration_date = datetime.now() - expiration_age
+                models.DAG.deactivate_stale_dags(expiration_date)
+
+            # Call hearbeats
+            self.logger.info("Heartbeating the executor")
+            executor.heartbeat()
+            self.logger.info("Heartbeating the scheduler")
+            self.heartbeat()
 
             loop_end_time = time.time()
-            self.logger.info("Ran loop in {:.2f}s".format(loop_end_time - loop_start_time))
+            self.logger.info("Ran scheduling loop in {:.2f}s".format(loop_end_time - loop_start_time))
             self.logger.info("Sleeping")
             time.sleep(1)
 
@@ -1703,7 +1780,7 @@ class SchedulerJob(BaseJob):
         try:
             dagbag = models.DagBag(file_path)
         except Exception as e:
-            self.logger.error("Failed at reloading the DAG file {}".format(file_path))
+            self.logger.exception("Failed at reloading the DAG file {}".format(file_path))
             Stats.incr('dag_file_refresh_error', 1, 1)
             return ProcessDagFileResult(SimpleDagBag([]), [])
 
@@ -1716,8 +1793,9 @@ class SchedulerJob(BaseJob):
             return ProcessDagFileResult(SimpleDagBag([]), [])
 
         # Save individual DAGs in the ORM
+        sync_time = datetime.now()
         for dag in dagbag.dags.values():
-            models.DAG.sync_to_db(dag)
+            models.DAG.sync_to_db(dag, sync_time)
 
         # Pickle the DAGs (if necessary) and put them into a SimpleDag
         for dag_id in dagbag.dags:

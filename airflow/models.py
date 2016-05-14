@@ -998,27 +998,27 @@ class TaskInstance(Base):
         # is the execution date in the future?
         if self.execution_date > datetime.now():
             # Remove me:
-            #logging.info("1 Returning false for {} {}".format(self.task_id, self.execution_date))
+            logging.info("Not runnable: self.execution_date > datetime.now()")
             return False
         # is the task still in the retry waiting period?
         elif self.state == State.UP_FOR_RETRY and not self.ready_for_retry():
             # Remove me:
-            #logging.info("2 Returning false for {} {}".format(self.task_id, self.execution_date))
+            logging.info("Not runnable: self.state == State.UP_FOR_RETRY and not self.ready_for_retry()")
             return False
         # does the task have an end_date prior to the execution date?
         elif self.task.end_date and self.execution_date > self.task.end_date:
             # Remove me:
-            #logging.info("3 Returning false for {} {}".format(self.task_id, self.execution_date))
+            logging.info("Not runnable: self.task.end_date and self.execution_date > self.task.end_date")
             return False
         # has the task been skipped?
         elif self.state == State.SKIPPED:
             # Remove me:
-            #logging.info("4 Returning false for {} {}".format(self.task_id, self.execution_date))
+            logging.info("Not runnable: self.state == State.SKIPPED")
             return False
         # has the task already been queued (and are we excluding queued tasks)?
         elif self.state == State.QUEUED and not include_queued:
             # Remove me:
-            #.info("5 Returning false for {} {}".format(self.task_id, self.execution_date))
+            logging.info("Not runnable: self.state == State.QUEUED and not include_queued:")
             return False
         # is the task runnable and have its dependencies been met?
         elif (
@@ -1027,12 +1027,12 @@ class TaskInstance(Base):
                     ignore_depends_on_past=ignore_depends_on_past,
                     flag_upstream_failed=flag_upstream_failed)):
             # Remove me:
-            #logging.info("7 Returning true for {} {} {}".format(self.task_id, self.execution_date, self.state))
+            logging.info("Runnable: self.state in State.runnable() and self.are_dependencies_met()")
             return True
         # anything else
         else:
             # Remove me:
-            #logging.info("6 Returning false for {} {} {}".format(self.task_id, self.execution_date, self.state))
+            logging.info("Not runnable: default")
             return False
 
     def is_runnable(
@@ -1055,6 +1055,9 @@ class TaskInstance(Base):
             include_queued=include_queued,
             ignore_depends_on_past=ignore_depends_on_past,
             flag_upstream_failed=flag_upstream_failed)
+        # Remove me
+        if self.pool_full():
+            logging.info("Not runnable - pool is full")
         return queueable and not self.pool_full()
 
     @provide_session
@@ -3182,7 +3185,7 @@ class DAG(LoggingMixin):
 
     @staticmethod
     @provide_session
-    def sync_to_db(dag, session=None):
+    def sync_to_db(dag, sync_time, session=None):
         """Save attributes about this DAG to the DB. Note that this method
         can be called for both DAGs and SubDAGs, which is actually a
         SubDagOperator"""
@@ -3195,6 +3198,7 @@ class DAG(LoggingMixin):
         orm_dag.is_subdag = dag.is_subdag
         orm_dag.owners = dag.owner
         orm_dag.is_active = True
+        orm_dag.last_scheduler_run = sync_time
         session.merge(orm_dag)
         session.commit()
 
@@ -3211,6 +3215,19 @@ class DAG(LoggingMixin):
             dag.is_active = False
             session.merge(dag)
 
+    @staticmethod
+    @provide_session
+    def deactivate_stale_dags(expiration_date, session=None):
+        """Deactivate any DAGs that were last touched by the scheduler before
+        the expiration date. These DAGs were likely deleted."""
+        for dag in session.query(
+                DagModel).filter(DagModel.last_scheduler_run < expiration_date and
+                                 DagModel.is_active).all():
+            logging.info("Deactivating DAG ID {} since it was last touched "
+                         "by the scheduler at {}"
+                         .format(dag.dag_id, dag.last_scheduler_run.isoformat()))
+            dag.is_active = False
+            session.merge(dag)
 
 
 class Chart(Base):
