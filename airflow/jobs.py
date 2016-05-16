@@ -1452,11 +1452,14 @@ class SchedulerJob(BaseJob):
         # for this long
         expiration_age = timedelta(minutes=60)
 
+        # Last time that self.heartbeat() was called.
+        last_self_heartbeat_time = datetime.now()
+
         # Use multiple processes to parse and generate tasks for the
         # DAGs in parallel. By processing them in separate processes,
         # we can get parallelism and isolation from potentially harmful
         # user code.
-        parallelism = 8
+        parallelism = 64
         self.logger.info("Processing files using up to {} processes at a time"
                          .format(parallelism))
 
@@ -1487,13 +1490,13 @@ class SchedulerJob(BaseJob):
 
                 # Since it's possible some files no longer exist, stop
                 # the processors from working on them
-                processors_to_stop = [x.file_path for x in processors
+                processors_to_stop = [x for x in processors
                                       if x.file_path not in known_file_paths]
-                processors_to_retain = [x.file_path for x in processors
+                processors_to_retain = [x for x in processors
                                         if x.file_path in known_file_paths]
 
                 for processor in processors_to_stop:
-                    self.logger.info("Stopping processor for {} since it no longer exists"
+                    self.logger.info("Stopping processor for {} since the file no longer exists"
                                      .format(processor.file_path))
                     processor.stop()
                 processors = processors_to_retain
@@ -1579,15 +1582,18 @@ class SchedulerJob(BaseJob):
                 models.DAG.deactivate_stale_dags(expiration_date)
 
             # Call hearbeats
-            self.logger.info("Heartbeating the executor")
-            executor.heartbeat()
-            self.logger.info("Heartbeating the scheduler")
-            self.heartbeat()
+            # TODO: Turned off for the test - re-enable
+            # self.logger.info("Heartbeating the executor")
+            # executor.heartbeat()
+
+            if (datetime.now() - last_self_heartbeat_time).total_seconds() > self.heartrate:
+                self.logger.info("Heartbeating the scheduler")
+                self.heartbeat()
 
             loop_end_time = time.time()
             self.logger.info("Ran scheduling loop in {:.2f}s".format(loop_end_time - loop_start_time))
             self.logger.info("Sleeping")
-            time.sleep(1)
+            time.sleep(1.0)
 
 
         # Why is this needed?
