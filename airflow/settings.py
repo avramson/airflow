@@ -66,17 +66,6 @@ SQL_ALCHEMY_CONN = conf.get('core', 'SQL_ALCHEMY_CONN')
 LOGGING_LEVEL = logging.INFO
 DAGS_FOLDER = os.path.expanduser(conf.get('core', 'DAGS_FOLDER'))
 
-engine_args = {}
-if 'sqlite' not in SQL_ALCHEMY_CONN:
-    # Engine args not supported by sqlite
-    engine_args['pool_size'] = conf.getint('core', 'SQL_ALCHEMY_POOL_SIZE')
-    engine_args['pool_recycle'] = conf.getint('core',
-                                              'SQL_ALCHEMY_POOL_RECYCLE')
-
-engine = create_engine(SQL_ALCHEMY_CONN, **engine_args)
-Session = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=engine))
-
 # can't move this to conf due to ConfigParser interpolation
 LOG_FORMAT = (
     '[%(asctime)s] {%(filename)s:%(lineno)d} %(threadName)s %(levelname)s - %(message)s')
@@ -115,6 +104,24 @@ def configure_logging():
     logging.basicConfig(
         format=LOG_FORMAT, stream=sys.stdout, level=LOGGING_LEVEL)
 
+engine = None
+Session = None
+
+
+def configure_orm():
+    global engine
+    global Session
+    engine_args = {}
+    if 'sqlite' not in SQL_ALCHEMY_CONN:
+        # Engine args not supported by sqlite
+        engine_args['pool_size'] = conf.getint('core', 'SQL_ALCHEMY_POOL_SIZE')
+        engine_args['pool_recycle'] = conf.getint('core',
+                                                  'SQL_ALCHEMY_POOL_RECYCLE')
+
+    engine = create_engine(SQL_ALCHEMY_CONN, **engine_args)
+    Session = scoped_session(
+        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+
 try:
     from airflow_local_settings import *
     logging.info("Loaded airflow_local_settings.")
@@ -122,3 +129,4 @@ except:
     pass
 
 configure_logging()
+configure_orm()
