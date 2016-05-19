@@ -106,7 +106,7 @@ class CoreTest(unittest.TestCase):
             owner='Also fake',
             start_date=datetime(2015, 1, 2, 0, 0)))
 
-        dag_run = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
+        dag_run = jobs.SchedulerJob(test_mode=True).create_dag_run(dag)
         assert dag_run is not None
         assert dag_run.dag_id == dag.dag_id
         assert dag_run.run_id is not None
@@ -139,7 +139,7 @@ class CoreTest(unittest.TestCase):
             external_trigger=True)
         settings.Session().add(trigger)
         settings.Session().commit()
-        dag_run = scheduler.schedule_dag(dag)
+        dag_run = scheduler.create_dag_run(dag)
         assert dag_run is not None
         assert dag_run.dag_id == dag.dag_id
         assert dag_run.run_id is not None
@@ -161,8 +161,8 @@ class CoreTest(unittest.TestCase):
             task_id="faketastic",
             owner='Also fake',
             start_date=datetime(2015, 1, 2, 0, 0)))
-        dag_run = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
-        dag_run2 = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
+        dag_run = jobs.SchedulerJob(test_mode=True).create_dag_run(dag)
+        dag_run2 = jobs.SchedulerJob(test_mode=True).create_dag_run(dag)
 
         assert dag_run is not None
         assert dag_run2 is None
@@ -190,9 +190,9 @@ class CoreTest(unittest.TestCase):
                                        owner='Also fake',
                                        start_date=date)
             dag.task_dict[task.task_id] = task
-            dag_runs.append(scheduler.schedule_dag(dag))
+            dag_runs.append(scheduler.create_dag_run(dag))
 
-        additional_dag_run = scheduler.schedule_dag(dag)
+        additional_dag_run = scheduler.create_dag_run(dag)
 
         for dag_run in dag_runs:
             assert dag_run is not None
@@ -232,7 +232,7 @@ class CoreTest(unittest.TestCase):
             dag.task_dict[task.task_id] = task
 
             # Schedule the DagRun
-            dag_run = scheduler.schedule_dag(dag)
+            dag_run = scheduler.create_dag_run(dag)
             dag_runs.append(dag_run)
 
             # Mark the DagRun as complete
@@ -241,7 +241,7 @@ class CoreTest(unittest.TestCase):
             session.commit()
 
         # Attempt to schedule an additional dag run (for 2016-01-01)
-        additional_dag_run = scheduler.schedule_dag(dag)
+        additional_dag_run = scheduler.create_dag_run(dag)
 
         for dag_run in dag_runs:
             assert dag_run is not None

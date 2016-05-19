@@ -182,10 +182,10 @@ class SchedulerJobTest(unittest.TestCase):
         scheduler = SchedulerJob()
         dag = self.dagbag.get_dag(dag_id)
         dag.clear()
-        dr = scheduler.schedule_dag(dag)
+        dr = scheduler.create_dag_run(dag)
         if advance_execution_date:
             # run a second time to schedule a dagrun after the start_date
-            dr = scheduler.schedule_dag(dag)
+            dr = scheduler.create_dag_run(dag)
         ex_date = dr.execution_date
 
         try:

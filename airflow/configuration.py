@@ -123,6 +123,7 @@ defaults = {
         'dag_dir_list_interval': 5 * 60,
         'print_stats_interval': 30,
         'file_process_interval': 120,
+        'child_process_log_directory': '/tmp/airflow/scheduler/logs'
     },
     'celery': {
         'default_queue': 'default',
