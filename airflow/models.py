@@ -3221,13 +3221,14 @@ class DAG(LoggingMixin):
         """Deactivate any DAGs that were last touched by the scheduler before
         the expiration date. These DAGs were likely deleted."""
         for dag in session.query(
-                DagModel).filter(DagModel.last_scheduler_run < expiration_date and
+                DagModel).filter(DagModel.last_scheduler_run < expiration_date,
                                  DagModel.is_active).all():
             logging.info("Deactivating DAG ID {} since it was last touched "
                          "by the scheduler at {}"
                          .format(dag.dag_id, dag.last_scheduler_run.isoformat()))
             dag.is_active = False
             session.merge(dag)
+            session.commit()
 
 
 class Chart(Base):

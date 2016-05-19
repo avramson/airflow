@@ -119,6 +119,10 @@ defaults = {
         'scheduler_heartbeat_sec': 60,
         'authenticate': False,
         'max_threads': 2,
+        'execute_duration': 3 * 60,
+        'dag_dir_list_interval': 5 * 60,
+        'print_stats_interval': 30,
+        'file_process_interval': 120,
     },
     'celery': {
         'default_queue': 'default',
