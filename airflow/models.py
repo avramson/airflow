@@ -3683,7 +3683,7 @@ class DagRun(Base):
             state=State.unfinished(),
             session=session
         )
-        none_depends_on_past = all(t.task.depends_on_past for t in unfinished_tasks)
+        none_depends_on_past = all(not t.task.depends_on_past for t in unfinished_tasks)
 
         # small speed up
         if unfinished_tasks and none_depends_on_past:

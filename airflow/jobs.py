@@ -648,7 +648,7 @@ class SchedulerJob(BaseJob):
         session.commit()
 
     @provide_session
-    def schedule_dag(self, dag, session=None):
+    def create_dag_run(self, dag, session=None):
         """
         This method checks whether a new DagRun needs to be created
         for a DAG based on scheduling interval
@@ -746,38 +746,11 @@ class SchedulerJob(BaseJob):
         DagModel = models.DagModel
         session = settings.Session()
 
-        # picklin'
-        pickle_id = None
-        if self.do_pickle and self.executor.__class__ not in (
-                executors.LocalExecutor, executors.SequentialExecutor):
-            pickle_id = dag.pickle(session).id
-
-        # obtain db lock
-        db_dag = session.query(DagModel).filter_by(
-            dag_id=dag.dag_id
-        ).with_for_update().one()
-
-        last_scheduler_run = db_dag.last_scheduler_run or datetime(2000, 1, 1)
-        secs_since_last = (datetime.now() - last_scheduler_run).total_seconds()
-
-        if secs_since_last < self.heartrate:
-            # release db lock
-            session.commit()
-            session.close()
-            return None
-
-        # Release the db lock
-        # the assumption here is that process_dag will take less
-        # time than self.heartrate otherwise we might unlock too
-        # quickly and this should moved below, but that would increase
-        # the time the record is locked and is blocking for other calls.
-        db_dag.last_scheduler_run = datetime.now()
-        session.commit()
-
         # update the state of the previously active dag runs
         dag_runs = DagRun.find(dag_id=dag.dag_id, state=State.RUNNING, session=session)
         active_dag_runs = []
         for run in dag_runs:
+            self.logger.info("Examining DAG run {}".format(run))
             # do not consider runs that are executed in the future
             if run.execution_date > datetime.now():
                 continue
@@ -792,6 +765,7 @@ class SchedulerJob(BaseJob):
                 active_dag_runs.append(run)
 
         for run in active_dag_runs:
+            self.logger.info("Examining active DAG run {}".format(run))
             # this needs a fresh session sometimes tis get detached
             tis = run.get_task_instances(state=(State.NONE,
                                                 State.UP_FOR_RETRY))
@@ -811,7 +785,7 @@ class SchedulerJob(BaseJob):
 
                 if ti.is_runnable(flag_upstream_failed=True):
                     self.logger.debug('Queuing task: {}'.format(ti))
-                    queue.put((ti.key, pickle_id))
+                    queue.put(ti.key)
 
         session.close()
 
@@ -824,7 +798,7 @@ class SchedulerJob(BaseJob):
         """
         For all DAG IDs in the SimpleDagBag, look for task instances in the
         old_state state and set them to new_state if the corresponding DagRun
-        is not running.
+        exists but is not in the running state.
 
         :param old_state: examine TaskInstances in this state
         :type old_state: State
@@ -885,7 +859,7 @@ class SchedulerJob(BaseJob):
         """
         # Get all the queued task instances
         TI = models.TaskInstance
-        queued_task_instances = (
+        task_instances_to_examine = (
             session
             .query(TI)
             .filter(TI.dag_id.in_(simple_dag_bag.dag_ids))
@@ -894,19 +868,19 @@ class SchedulerJob(BaseJob):
         )
 
         # Put one task instance on each line
-        if len(queued_task_instances) == 0:
+        if len(task_instances_to_examine) == 0:
             self.logger.info("No queued tasks to send to the executor")
             return
 
         task_instance_str = "\n\t".join(
-            ["{}".format(x) for x in queued_task_instances])
+            ["{}".format(x) for x in task_instances_to_examine])
         self.logger.info("Queued tasks up for execution:\n\t{}".format(task_instance_str))
 
         # Get the pool settings
         pools = {p.pool: p for p in session.query(models.Pool).all()}
 
         pool_to_task_instances = defaultdict(list)
-        for task_instance in queued_task_instances:
+        for task_instance in task_instances_to_examine:
             pool_to_task_instances[task_instance.pool].append(task_instance)
 
         # Go through each pool, and queue up a task for execution if there are
@@ -996,6 +970,12 @@ class SchedulerJob(BaseJob):
                     priority=priority,
                     queue=queue)
 
+                self.logger.info("Setting state of {} to {}".format(
+                    task_instance.key, State.QUEUED))
+                task_instance.state = State.QUEUED
+                task_instance.queued_dttm = datetime.now()
+                session.merge(task_instance)
+
                 open_slots -= 1
 
     def _process_dags(self, dagbag, dags, tis_out):
@@ -1027,7 +1007,9 @@ class SchedulerJob(BaseJob):
 
             self.logger.info("Processing {}".format(dag.dag_id))
 
-            self.create_dag_run(dag)
+            dag_run = self.create_dag_run(dag)
+            if dag_run:
+                self.logger.info("Created {}".format(dag_run))
             self._process_task_instances(dag, tis_out)
             self.manage_slas(dag)
 
@@ -1125,17 +1107,21 @@ class SchedulerJob(BaseJob):
 
         # also consider running as the state might not have changed in the db yet
         running = self.executor.running
-        tis = dag_run.get_task_instances(state=State.SCHEDULED, session=session)
+        tis = list()
+        tis.extend(dag_run.get_task_instances(state=State.SCHEDULED, session=session))
+        tis.extend(dag_run.get_task_instances(state=State.QUEUED, session=session))
+
         for ti in tis:
             if ti.key not in queued_tis and ti.key not in running:
-                ti.state = State.NONE
                 self.logger.debug("Rescheduling orphaned task {}".format(ti))
-
+                ti.state = State.NONE
         session.commit()
 
     def _execute(self):
-        session = settings.Session()
-        TI = models.TaskInstance
+        self.logger.info("Starting the scheduler")
+        pessimistic_connection_handling()
+
+        logging.basicConfig(level=logging.DEBUG)
 
         # DAGs can be pickled for easier remote execution by some executors
         pickle_dags = False
@@ -1214,17 +1200,26 @@ class SchedulerJob(BaseJob):
                         child.kill()
                         child.wait()
 
-    def _execute_helper(self, processor_manager):
+    @provide_session
+    def _execute_helper(self, processor_manager, session=None):
         """
         :param processor_manager: manager to use
         :type processor_manager: DagFileProcessorManager
         :return: None
         """
-        pessimistic_connection_handling()
-
-        logging.basicConfig(level=logging.DEBUG)
-        self.logger.info("Starting the scheduler")
         self.executor.start()
+
+        self.logger.info("Resetting state for orphaned tasks")
+        # grab orphaned tasks and make sure to reset their state
+        active_runs = DagRun.find(
+            state=State.RUNNING,
+            external_trigger=False,
+            session=session
+        )
+        for dr in active_runs:
+            self.logger.info("Resetting {} {}".format(dr.dag_id,
+                                                      dr.execution_date))
+            self._reset_state_for_orphaned_tasks(dr, session=session)
 
         execute_start_time = datetime.now()
 
@@ -1277,7 +1272,7 @@ class SchedulerJob(BaseJob):
                                                           State.QUEUED,
                                                           State.NONE)
                 self._execute_task_instances(simple_dag_bag,
-                                             (State.QUEUED,
+                                             (State.SCHEDULED,
                                               State.UP_FOR_RETRY))
 
             # Call hearbeats
@@ -1290,7 +1285,7 @@ class SchedulerJob(BaseJob):
             # Heartbeat the scheduler periodically
             time_since_last_heartbeat = (datetime.now() -
                                          last_self_heartbeat_time).total_seconds()
-            if  time_since_last_heartbeat > self.heartrate:
+            if time_since_last_heartbeat > self.heartrate:
                 self.logger.info("Heartbeating the scheduler")
                 self.heartbeat()
                 last_self_heartbeat_time = datetime.now()
@@ -1427,7 +1422,7 @@ class SchedulerJob(BaseJob):
             ti = models.TaskInstance(task, ti_key[2])
             # Task starts out in the queued state. All tasks in the queued
             # state will be scheduled later in the execution loop.
-            ti.state = State.QUEUED
+            ti.state = State.SCHEDULED
 
             # Also save this task instance to the DB.
             self.logger.info("Creating / updating {} in ORM".format(ti))
